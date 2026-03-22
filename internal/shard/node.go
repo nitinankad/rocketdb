@@ -33,6 +33,7 @@ func (n *Node) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", n.handleHealth)
 	mux.HandleFunc("/metrics", n.handleMetrics)
 	mux.HandleFunc("/v1/kv", n.handleKV)
+	mux.HandleFunc("/v1/scan", n.handleScan)
 }
 
 type kvRequest struct {
@@ -40,6 +41,18 @@ type kvRequest struct {
 	Key     string `json:"key"`
 	Value   string `json:"value,omitempty"`
 	ShardID int    `json:"shard_id"`
+}
+
+type scanRequest struct {
+	Table   string `json:"table"`
+	ShardID int    `json:"shard_id"`
+	Cursor  string `json:"cursor,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+}
+
+type scanRow struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 func (n *Node) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -141,6 +154,57 @@ func (n *Node) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (n *Node) handleScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req scanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.Table == "" {
+		writeError(w, http.StatusBadRequest, "table is required")
+		return
+	}
+	if req.ShardID < 0 {
+		writeError(w, http.StatusBadRequest, "shard_id must be >= 0")
+		return
+	}
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+	if req.Limit > 1000 {
+		req.Limit = 1000
+	}
+
+	if !n.meta.IsReplica(n.id, req.ShardID) {
+		writeError(w, http.StatusConflict, "node does not own this shard")
+		return
+	}
+
+	rows, next, err := n.store.Scan(r.Context(), req.Table, req.Cursor, req.Limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]scanRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, scanRow{
+			Key:   row.Key,
+			Value: string(row.Value),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":        out,
+		"next_cursor": next,
+	})
 }
 
 func decodeBody(ctx context.Context, r *http.Request) (kvRequest, error) {

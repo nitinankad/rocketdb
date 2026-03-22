@@ -18,7 +18,7 @@ func main() {
 	meta := metadata.DefaultBootstrap()
 	rt := router.New(meta)
 
-	gatewaySrv := gateway.NewServer(rt, meta)
+	gatewaySrv := gateway.NewServer(rt, meta, cluster)
 	gatewayMux := http.NewServeMux()
 	gatewaySrv.RegisterHTTP(gatewayMux)
 	go func() {

@@ -46,3 +46,19 @@ curl -X PUT localhost:8081/v1/kv \
   -H "content-type: application/json" \
   -d '{"table":"users","key":"user-123","value":"{\"name\":\"Ada\"}","shard_id":0}'
 ```
+
+Full table scan via gateway (paginated):
+
+```bash
+curl -X POST localhost:8080/v1/scan \
+  -H "content-type: application/json" \
+  -d '{"table":"users","limit":50,"consistency":"strong"}'
+```
+
+Use `next_cursor` from the response to fetch the next page:
+
+```bash
+curl -X POST localhost:8080/v1/scan \
+  -H "content-type: application/json" \
+  -d '{"table":"users","limit":50,"cursor":"<next_cursor>","consistency":"strong"}'
+```

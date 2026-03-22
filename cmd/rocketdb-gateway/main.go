@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/nitinankad/rocketdb/internal/config"
 	"github.com/nitinankad/rocketdb/internal/gateway"
 	"github.com/nitinankad/rocketdb/internal/metadata"
 	"github.com/nitinankad/rocketdb/internal/router"
@@ -14,9 +15,10 @@ func main() {
 	addr := flag.String("addr", ":8080", "gateway listen address")
 	flag.Parse()
 
+	cluster := config.DefaultCluster()
 	meta := metadata.DefaultBootstrap()
 	rt := router.New(meta)
-	srv := gateway.NewServer(rt, meta)
+	srv := gateway.NewServer(rt, meta, cluster)
 
 	mux := http.NewServeMux()
 	srv.RegisterHTTP(mux)
