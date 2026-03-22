@@ -20,13 +20,14 @@ func New(meta *metadata.Service) *Router {
 }
 
 func (r *Router) RouteByPartitionKey(partitionKey string) Route {
-	shardCount := len(r.meta.Shards)
+	shards := r.meta.ShardsSnapshot()
+	shardCount := len(shards)
 	if shardCount == 0 {
 		return Route{}
 	}
 
 	shardID := int(hashKey(partitionKey) % uint32(shardCount))
-	shard := r.meta.Shards[shardID]
+	shard := shards[shardID]
 
 	return Route{
 		ShardID: shard.ID,

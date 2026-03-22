@@ -45,7 +45,7 @@ Write through gateway (no manual node routing needed):
 ```bash
 curl -X PUT localhost:8080/v1/kv \
   -H "content-type: application/json" \
-  -d '{"table":"users","key":"user-123","value":"{\"name\":\"Ada\"}"}'
+  -d '{"table":"users","key":"user-123","item":{"name":"Ada","age":42,"city":"Austin"}}'
 ```
 
 Read through gateway:
@@ -83,8 +83,36 @@ curl -X POST localhost:8080/v1/scan \
 All commands below go through the gateway (`:8080`) and auto-route to the right shard.
 
 ```bash
-go run ./cmd/rocketdb-cli put  --table users --key user-123 --value '{"name":"Ada"}'
+go run ./cmd/rocketdb-cli put  --table users --key user-123 --item '{"name":"Ada","age":42}'
 go run ./cmd/rocketdb-cli get  --table users --key user-123
 go run ./cmd/rocketdb-cli del  --table users --key user-123
 go run ./cmd/rocketdb-cli scan --table users --limit 10
+go run ./cmd/rocketdb-cli sql  "insert into users (key, name, age) values ('u1','Ada',42)"
+go run ./cmd/rocketdb-cli sql  "select * from users where key = 'u1'"
+```
+
+## Auto Rebalance (Toy)
+
+Gateway now supports topology changes with automatic data migration.
+
+Add a node (gateway updates shard map + migrates existing records):
+
+```bash
+curl -X POST localhost:8080/v1/admin/nodes/add \
+  -H "content-type: application/json" \
+  -d '{"id":"node-4","address":":8084"}'
+```
+
+Remove a node (migrates records away first):
+
+```bash
+curl -X POST localhost:8080/v1/admin/nodes/remove \
+  -H "content-type: application/json" \
+  -d '{"id":"node-2"}'
+```
+
+Inspect current topology:
+
+```bash
+curl localhost:8080/v1/admin/topology
 ```

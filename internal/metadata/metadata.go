@@ -3,6 +3,7 @@ package metadata
 import (
 	"fmt"
 	"slices"
+	"sync"
 )
 
 type Table struct {
@@ -18,6 +19,7 @@ type Shard struct {
 }
 
 type Service struct {
+	mu     sync.RWMutex
 	Tables map[string]Table
 	Shards []Shard
 }
@@ -40,6 +42,9 @@ func DefaultBootstrap() *Service {
 }
 
 func (s *Service) Table(name string) (Table, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	t, ok := s.Tables[name]
 	if !ok {
 		return Table{}, fmt.Errorf("table not found: %s", name)
@@ -48,6 +53,9 @@ func (s *Service) Table(name string) (Table, error) {
 }
 
 func (s *Service) ShardByID(id int) (Shard, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	for _, shard := range s.Shards {
 		if shard.ID == id {
 			return shard, nil
@@ -70,4 +78,45 @@ func (s *Service) IsReplica(nodeID string, shardID int) bool {
 		return false
 	}
 	return shard.Leader == nodeID || slices.Contains(shard.Followers, nodeID)
+}
+
+func (s *Service) ShardsSnapshot() []Shard {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Shard, len(s.Shards))
+	for i, shard := range s.Shards {
+		out[i] = Shard{
+			ID:        shard.ID,
+			Leader:    shard.Leader,
+			Followers: append([]string(nil), shard.Followers...),
+		}
+	}
+	return out
+}
+
+func (s *Service) ReplaceShards(shards []Shard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]Shard, len(shards))
+	for i, shard := range shards {
+		out[i] = Shard{
+			ID:        shard.ID,
+			Leader:    shard.Leader,
+			Followers: append([]string(nil), shard.Followers...),
+		}
+	}
+	s.Shards = out
+}
+
+func (s *Service) TableNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make([]string, 0, len(s.Tables))
+	for name := range s.Tables {
+		names = append(names, name)
+	}
+	return names
 }

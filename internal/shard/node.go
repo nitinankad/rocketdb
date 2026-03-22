@@ -34,13 +34,15 @@ func (n *Node) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", n.handleMetrics)
 	mux.HandleFunc("/v1/kv", n.handleKV)
 	mux.HandleFunc("/v1/scan", n.handleScan)
+	mux.HandleFunc("/v1/admin/topology", n.handleTopology)
 }
 
 type kvRequest struct {
-	Table   string `json:"table"`
-	Key     string `json:"key"`
-	Value   string `json:"value,omitempty"`
-	ShardID int    `json:"shard_id"`
+	Table   string         `json:"table"`
+	Key     string         `json:"key"`
+	Value   string         `json:"value,omitempty"`
+	Item    map[string]any `json:"item,omitempty"`
+	ShardID int            `json:"shard_id"`
 }
 
 type scanRequest struct {
@@ -51,8 +53,12 @@ type scanRequest struct {
 }
 
 type scanRow struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Key  string         `json:"key"`
+	Item map[string]any `json:"item"`
+}
+
+type topologyRequest struct {
+	Shards []metadata.Shard `json:"shards"`
 }
 
 func (n *Node) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -93,11 +99,18 @@ func (n *Node) handleGetKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
+	item, err := decodeStoredItem(val)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := map[string]any{
 		"table": table,
 		"key":   key,
-		"value": string(val),
-	})
+		"item":  item,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (n *Node) handlePutKV(w http.ResponseWriter, r *http.Request) {
@@ -116,11 +129,21 @@ func (n *Node) handlePutKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := n.store.Put(r.Context(), req.Table, req.Key, []byte(req.Value)); err != nil {
+	item := req.Item
+	if item == nil {
+		item = map[string]any{"value": req.Value}
+	}
+	payload, err := json.Marshal(item)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "item must be valid json object")
+		return
+	}
+
+	if err := n.store.Put(r.Context(), req.Table, req.Key, payload); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := n.replication.Replicate(r.Context(), req.ShardID, req.Table, req.Key, []byte(req.Value)); err != nil {
+	if err := n.replication.Replicate(r.Context(), req.ShardID, req.Table, req.Key, payload); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -195,16 +218,42 @@ func (n *Node) handleScan(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]scanRow, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, scanRow{
-			Key:   row.Key,
-			Value: string(row.Value),
-		})
+		item, err := decodeStoredItem(row.Value)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		entry := scanRow{
+			Key:  row.Key,
+			Item: item,
+		}
+		out = append(out, entry)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rows":        out,
 		"next_cursor": next,
 	})
+}
+
+func (n *Node) handleTopology(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req topologyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(req.Shards) == 0 {
+		writeError(w, http.StatusBadRequest, "shards are required")
+		return
+	}
+
+	n.meta.ReplaceShards(req.Shards)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func decodeBody(ctx context.Context, r *http.Request) (kvRequest, error) {
@@ -244,4 +293,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 		"error": msg,
 		"code":  strconv.Itoa(status),
 	})
+}
+
+func decodeStoredItem(raw []byte) (map[string]any, error) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return nil, fmt.Errorf("stored record is not a valid json object")
+	}
+	return item, nil
 }
