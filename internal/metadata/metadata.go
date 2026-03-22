@@ -9,6 +9,11 @@ import (
 type Table struct {
 	Name              string
 	PartitionKey      string
+	SortKey           string
+	GSI1Name          string
+	GSI1PKAttribute   string
+	GSI1SKAttribute   string
+	TTLAttribute      string
 	ReplicationFactor int
 }
 
@@ -29,7 +34,12 @@ func DefaultBootstrap() *Service {
 		Tables: map[string]Table{
 			"users": {
 				Name:              "users",
-				PartitionKey:      "id",
+				PartitionKey:      "key",
+				SortKey:           "sort_key",
+				GSI1Name:          "gsi1",
+				GSI1PKAttribute:   "gsi1pk",
+				GSI1SKAttribute:   "gsi1sk",
+				TTLAttribute:      "ttl_epoch",
 				ReplicationFactor: 2,
 			},
 		},
@@ -119,4 +129,17 @@ func (s *Service) TableNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func (s *Service) UpsertTable(t Table) error {
+	if t.Name == "" {
+		return fmt.Errorf("table name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Tables == nil {
+		s.Tables = make(map[string]Table)
+	}
+	s.Tables[t.Name] = t
+	return nil
 }

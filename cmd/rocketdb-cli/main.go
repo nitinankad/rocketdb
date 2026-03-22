@@ -33,6 +33,14 @@ func main() {
 		runDelete(os.Args[2:])
 	case "scan":
 		runScan(os.Args[2:])
+	case "query":
+		runQuery(os.Args[2:])
+	case "query-gsi":
+		runQueryGSI(os.Args[2:])
+	case "table-upsert":
+		runTableUpsert(os.Args[2:])
+	case "streams":
+		runStreams(os.Args[2:])
 	case "sql":
 		runSQL(os.Args[2:])
 	case "help", "-h", "--help":
@@ -49,6 +57,7 @@ func runPut(args []string) {
 	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
+	sortKey := fs.String("sort-key", "", "optional sort key")
 	value := fs.String("value", "", "record value")
 	item := fs.String("item", "", "json object of dynamic attributes")
 	_ = fs.Parse(args)
@@ -59,6 +68,9 @@ func runPut(args []string) {
 	reqPayload := map[string]any{
 		"table": *table,
 		"key":   *key,
+	}
+	if *sortKey != "" {
+		reqPayload["sort_key"] = *sortKey
 	}
 	if strings.TrimSpace(*item) != "" {
 		var itemObj map[string]any
@@ -81,6 +93,7 @@ func runGet(args []string) {
 	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
+	sortKey := fs.String("sort-key", "", "optional sort key")
 	consistency := fs.String("consistency", "strong", "read consistency: strong|eventual")
 	_ = fs.Parse(args)
 
@@ -89,10 +102,11 @@ func runGet(args []string) {
 	require(*consistency == "strong" || *consistency == "eventual", "--consistency must be strong or eventual")
 
 	target := fmt.Sprintf(
-		"%s/v1/kv?table=%s&key=%s&consistency=%s",
+		"%s/v1/kv?table=%s&key=%s&sort_key=%s&consistency=%s",
 		strings.TrimRight(*gateway, "/"),
 		url.QueryEscape(*table),
 		url.QueryEscape(*key),
+		url.QueryEscape(*sortKey),
 		url.QueryEscape(*consistency),
 	)
 
@@ -106,14 +120,16 @@ func runDelete(args []string) {
 	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
+	sortKey := fs.String("sort-key", "", "optional sort key")
 	_ = fs.Parse(args)
 
 	require(*table != "", "--table is required")
 	require(*key != "", "--key is required")
 
 	body, err := json.Marshal(map[string]string{
-		"table": *table,
-		"key":   *key,
+		"table":    *table,
+		"key":      *key,
+		"sort_key": *sortKey,
 	})
 	must(err)
 
@@ -143,6 +159,111 @@ func runScan(args []string) {
 	must(err)
 
 	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/scan", body)
+	must(err)
+	printResponse(status, payload)
+}
+
+func runQuery(args []string) {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	table := fs.String("table", "", "table name")
+	key := fs.String("key", "", "partition key")
+	sortOp := fs.String("sort-op", "", "sort op: any|eq|begins_with|gt|gte|lt|lte")
+	sortValue := fs.String("sort-value", "", "sort comparison value")
+	limit := fs.Int("limit", 100, "page size")
+	cursor := fs.String("cursor", "", "pagination cursor")
+	consistency := fs.String("consistency", "strong", "read consistency: strong|eventual")
+	_ = fs.Parse(args)
+
+	require(*table != "", "--table is required")
+	require(*key != "", "--key is required")
+
+	body, err := json.Marshal(map[string]any{
+		"table":       *table,
+		"key":         *key,
+		"sort_op":     *sortOp,
+		"sort_value":  *sortValue,
+		"limit":       *limit,
+		"cursor":      *cursor,
+		"consistency": *consistency,
+	})
+	must(err)
+	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/query", body)
+	must(err)
+	printResponse(status, payload)
+}
+
+func runQueryGSI(args []string) {
+	fs := flag.NewFlagSet("query-gsi", flag.ExitOnError)
+	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	table := fs.String("table", "", "table name")
+	index := fs.String("index", "gsi1", "index name")
+	pkValue := fs.String("pk-value", "", "gsi partition value")
+	skOp := fs.String("sk-op", "", "sort op: any|eq|begins_with|gt|gte|lt|lte")
+	skValue := fs.String("sk-value", "", "gsi sort comparison value")
+	limit := fs.Int("limit", 100, "page size")
+	cursor := fs.String("cursor", "", "pagination cursor")
+	consistency := fs.String("consistency", "strong", "read consistency: strong|eventual")
+	_ = fs.Parse(args)
+
+	require(*table != "", "--table is required")
+	require(*pkValue != "", "--pk-value is required")
+
+	body, err := json.Marshal(map[string]any{
+		"table":       *table,
+		"index":       *index,
+		"pk_value":    *pkValue,
+		"sk_op":       *skOp,
+		"sk_value":    *skValue,
+		"limit":       *limit,
+		"cursor":      *cursor,
+		"consistency": *consistency,
+	})
+	must(err)
+	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/query-gsi", body)
+	must(err)
+	printResponse(status, payload)
+}
+
+func runTableUpsert(args []string) {
+	fs := flag.NewFlagSet("table-upsert", flag.ExitOnError)
+	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	name := fs.String("name", "", "table name")
+	pk := fs.String("pk", "key", "partition key field name")
+	sk := fs.String("sk", "", "sort key field name")
+	gsiName := fs.String("gsi-name", "gsi1", "single GSI name")
+	gsiPK := fs.String("gsi-pk-attr", "gsi1pk", "GSI partition attribute")
+	gsiSK := fs.String("gsi-sk-attr", "gsi1sk", "GSI sort attribute (optional)")
+	ttlAttr := fs.String("ttl-attr", "ttl_epoch", "TTL attribute name")
+	_ = fs.Parse(args)
+
+	require(*name != "", "--name is required")
+
+	body, err := json.Marshal(map[string]any{
+		"name":               *name,
+		"partition_key":      *pk,
+		"sort_key":           *sk,
+		"gsi1_name":          *gsiName,
+		"gsi1_pk_attribute":  *gsiPK,
+		"gsi1_sk_attribute":  *gsiSK,
+		"ttl_attribute":      *ttlAttr,
+		"replication_factor": 2,
+	})
+	must(err)
+	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/admin/tables/upsert", body)
+	must(err)
+	printResponse(status, payload)
+}
+
+func runStreams(args []string) {
+	fs := flag.NewFlagSet("streams", flag.ExitOnError)
+	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	cursor := fs.Int64("cursor", 0, "stream cursor")
+	limit := fs.Int("limit", 100, "max events")
+	_ = fs.Parse(args)
+
+	target := fmt.Sprintf("%s/v1/streams?cursor=%d&limit=%d", strings.TrimRight(*gateway, "/"), *cursor, *limit)
+	status, payload, err := request(http.MethodGet, target, nil)
 	must(err)
 	printResponse(status, payload)
 }
@@ -214,6 +335,7 @@ func runSQL(args []string) {
 
 		item := make(map[string]any, len(cols))
 		key := ""
+		sortKey := ""
 		for i := range cols {
 			col := strings.TrimSpace(cols[i])
 			require(col != "", "insert column cannot be empty")
@@ -224,14 +346,19 @@ func runSQL(args []string) {
 				key = fmt.Sprint(val)
 				continue
 			}
+			if strings.EqualFold(col, "sort_key") {
+				sortKey = fmt.Sprint(val)
+				continue
+			}
 			item[col] = val
 		}
 		require(key != "", "insert must include key column")
 
 		body, err := json.Marshal(map[string]any{
-			"table": table,
-			"key":   key,
-			"item":  item,
+			"table":    table,
+			"key":      key,
+			"sort_key": sortKey,
+			"item":     item,
 		})
 		must(err)
 		status, payload, err := request(http.MethodPut, base+"/v1/kv", body)
@@ -386,5 +513,9 @@ func printUsage() {
 	fmt.Println("  rocketdb-cli get  --table users --key user-1 [--consistency strong|eventual] [--gateway http://localhost:8080]")
 	fmt.Println("  rocketdb-cli del  --table users --key user-1 [--gateway http://localhost:8080]")
 	fmt.Println("  rocketdb-cli scan --table users [--limit 50] [--cursor '<cursor>'] [--consistency strong|eventual] [--gateway http://localhost:8080]")
+	fmt.Println("  rocketdb-cli query --table users --key p1 [--sort-op begins_with --sort-value 2026-] [--gateway http://localhost:8080]")
+	fmt.Println("  rocketdb-cli query-gsi --table users --index by_email --pk-value a@x.com [--sk-op gte --sk-value 0]")
+	fmt.Println("  rocketdb-cli table-upsert --name users --pk key --sk sort_key --gsi-name by_email --gsi-pk-attr email --gsi-sk-attr created_at")
+	fmt.Println("  rocketdb-cli streams [--cursor 0] [--limit 100]")
 	fmt.Println("  rocketdb-cli sql  \"insert into users (key, name, age) values ('u1','Ada',42)\" [--gateway http://localhost:8080]")
 }

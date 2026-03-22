@@ -52,8 +52,12 @@ func (s *Server) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/route", s.handleRoute)
 	mux.HandleFunc("/v1/kv", s.handleKV)
+	mux.HandleFunc("/v1/query", s.handleQuery)
+	mux.HandleFunc("/v1/query-gsi", s.handleQueryGSI)
+	mux.HandleFunc("/v1/streams", s.handleStreams)
 	mux.HandleFunc("/v1/scan", s.handleScan)
 	mux.HandleFunc("/v1/admin/topology", s.handleTopology)
+	mux.HandleFunc("/v1/admin/tables/upsert", s.handleUpsertTable)
 	mux.HandleFunc("/v1/admin/nodes/add", s.handleAddNode)
 	mux.HandleFunc("/v1/admin/nodes/remove", s.handleRemoveNode)
 }
@@ -66,8 +70,10 @@ type routeRequest struct {
 type kvRequest struct {
 	Table       string         `json:"table"`
 	Key         string         `json:"key"`
+	SortKey     string         `json:"sort_key,omitempty"`
 	Value       string         `json:"value,omitempty"`
 	Item        map[string]any `json:"item,omitempty"`
+	Condition   any            `json:"condition,omitempty"`
 	Consistency string         `json:"consistency,omitempty"`
 }
 
@@ -80,6 +86,7 @@ type scanRequest struct {
 
 type scanRow struct {
 	Key     string         `json:"key"`
+	SortKey string         `json:"sort_key,omitempty"`
 	Item    map[string]any `json:"item,omitempty"`
 	ShardID int            `json:"shard_id"`
 }
@@ -93,17 +100,24 @@ type nodeScanRequest struct {
 
 type nodeScanResponse struct {
 	Rows []struct {
-		Key  string         `json:"key"`
-		Item map[string]any `json:"item"`
+		Key     string         `json:"key"`
+		SortKey string         `json:"sort_key,omitempty"`
+		Item    map[string]any `json:"item"`
 	} `json:"rows"`
 	NextCursor string `json:"next_cursor"`
 }
 
+type nodeStreamsResponse struct {
+	Events []map[string]any `json:"events"`
+}
+
 type nodeUpsertRequest struct {
-	Table   string         `json:"table"`
-	Key     string         `json:"key"`
-	Item    map[string]any `json:"item,omitempty"`
-	ShardID int            `json:"shard_id"`
+	Table     string         `json:"table"`
+	Key       string         `json:"key"`
+	SortKey   string         `json:"sort_key,omitempty"`
+	Item      map[string]any `json:"item,omitempty"`
+	Condition any            `json:"condition,omitempty"`
+	ShardID   int            `json:"shard_id"`
 }
 
 type adminNodeRequest struct {
@@ -115,10 +129,53 @@ type topologyRequest struct {
 	Shards []metadata.Shard `json:"shards"`
 }
 
+type queryRequest struct {
+	Table       string `json:"table"`
+	Key         string `json:"key"`
+	SortOp      string `json:"sort_op,omitempty"`
+	SortValue   string `json:"sort_value,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+	Cursor      string `json:"cursor,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
+}
+
+type gsiQueryRequest struct {
+	Table       string `json:"table"`
+	Index       string `json:"index,omitempty"`
+	PKValue     string `json:"pk_value"`
+	SKOp        string `json:"sk_op,omitempty"`
+	SKValue     string `json:"sk_value,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+	Cursor      string `json:"cursor,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
+}
+
+type streamsRequest struct {
+	Cursor      int64  `json:"cursor,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
+}
+
+type tableUpsertRequest struct {
+	Name              string `json:"name"`
+	PartitionKey      string `json:"partition_key"`
+	SortKey           string `json:"sort_key,omitempty"`
+	GSI1Name          string `json:"gsi1_name,omitempty"`
+	GSI1PKAttribute   string `json:"gsi1_pk_attribute,omitempty"`
+	GSI1SKAttribute   string `json:"gsi1_sk_attribute,omitempty"`
+	TTLAttribute      string `json:"ttl_attribute,omitempty"`
+	ReplicationFactor int    `json:"replication_factor,omitempty"`
+}
+
+type nodeTableUpsertRequest struct {
+	Table metadata.Table `json:"table"`
+}
+
 type rebalanceRecord struct {
-	Table string
-	Key   string
-	Item  map[string]any
+	Table   string
+	Key     string
+	SortKey string
+	Item    map[string]any
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -169,6 +226,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 	table := r.URL.Query().Get("table")
 	key := r.URL.Query().Get("key")
+	sortKey := r.URL.Query().Get("sort_key")
 	consistency := r.URL.Query().Get("consistency")
 	if consistency == "" {
 		consistency = "strong"
@@ -192,10 +250,11 @@ func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodeURL := fmt.Sprintf("http://localhost%s/v1/kv?table=%s&key=%s",
+	nodeURL := fmt.Sprintf("http://localhost%s/v1/kv?table=%s&key=%s&sort_key=%s",
 		addr,
 		url.QueryEscape(table),
 		url.QueryEscape(key),
+		url.QueryEscape(sortKey),
 	)
 	status, payload, err := s.forwardNode(r.Context(), http.MethodGet, nodeURL, nil)
 	if err != nil {
@@ -227,10 +286,12 @@ func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeBody, err := json.Marshal(nodeUpsertRequest{
-		Table:   req.Table,
-		Key:     req.Key,
-		Item:    chooseItem(req),
-		ShardID: shardID,
+		Table:     req.Table,
+		Key:       req.Key,
+		SortKey:   req.SortKey,
+		Item:      chooseItem(req),
+		Condition: req.Condition,
+		ShardID:   shardID,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -269,6 +330,7 @@ func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 	nodeBody, err := json.Marshal(map[string]any{
 		"table":    req.Table,
 		"key":      req.Key,
+		"sort_key": req.SortKey,
 		"shard_id": shardID,
 	})
 	if err != nil {
@@ -282,6 +344,206 @@ func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONRaw(w, status, payload)
+}
+
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req queryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Table == "" || req.Key == "" {
+		writeError(w, http.StatusBadRequest, "table and key are required")
+		return
+	}
+	if req.Consistency == "" {
+		req.Consistency = "strong"
+	}
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+	if req.Limit > 1000 {
+		req.Limit = 1000
+	}
+
+	addr, shardID, err := s.resolveNodeForKey(req.Key, req.Consistency)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"table":      req.Table,
+		"key":        req.Key,
+		"sort_op":    req.SortOp,
+		"sort_value": req.SortValue,
+		"limit":      req.Limit,
+		"cursor":     req.Cursor,
+		"shard_id":   shardID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	status, payload, err := s.forwardNode(r.Context(), http.MethodPost, "http://localhost"+addr+"/v1/query", body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSONRaw(w, status, payload)
+}
+
+func (s *Server) handleQueryGSI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req gsiQueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Table == "" || req.PKValue == "" {
+		writeError(w, http.StatusBadRequest, "table and pk_value are required")
+		return
+	}
+	if req.Consistency == "" {
+		req.Consistency = "strong"
+	}
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+	if req.Limit > 1000 {
+		req.Limit = 1000
+	}
+
+	shards := s.meta.ShardsSnapshot()
+	startShardIdx, shardCursor, err := parseGatewayCursor(req.Cursor)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if startShardIdx < 0 || startShardIdx >= len(shards) {
+		writeError(w, http.StatusBadRequest, "cursor shard index out of range")
+		return
+	}
+
+	rows := make([]scanRow, 0, req.Limit)
+	nextCursor := ""
+
+	for i := startShardIdx; i < len(shards) && len(rows) < req.Limit; i++ {
+		shard := shards[i]
+		nodeID := shard.Leader
+		if req.Consistency == "eventual" && len(shard.Followers) > 0 {
+			nodeID = shard.Followers[0]
+		}
+		addr, err := s.addressByNodeID(nodeID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		body, err := json.Marshal(map[string]any{
+			"table":    req.Table,
+			"index":    req.Index,
+			"pk_value": req.PKValue,
+			"sk_op":    req.SKOp,
+			"sk_value": req.SKValue,
+			"limit":    req.Limit - len(rows),
+			"cursor": func() string {
+				if i == startShardIdx {
+					return shardCursor
+				}
+				return ""
+			}(),
+			"shard_id": shard.ID,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		status, payload, err := s.forwardNode(r.Context(), http.MethodPost, "http://localhost"+addr+"/v1/query-gsi", body)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if status != http.StatusOK {
+			writeJSONRaw(w, status, payload)
+			return
+		}
+
+		var nodeResp nodeScanResponse
+		if err := json.Unmarshal(payload, &nodeResp); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		for _, rr := range nodeResp.Rows {
+			rows = append(rows, scanRow{Key: rr.Key, SortKey: rr.SortKey, Item: rr.Item, ShardID: shard.ID})
+		}
+		if len(rows) == req.Limit {
+			if nodeResp.NextCursor != "" {
+				nextCursor = fmt.Sprintf("%d|%s", i, nodeResp.NextCursor)
+			}
+			break
+		}
+		if nodeResp.NextCursor != "" {
+			nextCursor = fmt.Sprintf("%d|%s", i, nodeResp.NextCursor)
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"rows": rows, "next_cursor": nextCursor})
+}
+
+func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	cursor := r.URL.Query().Get("cursor")
+	if cursor == "" {
+		cursor = "0"
+	}
+	limit := r.URL.Query().Get("limit")
+	if limit == "" {
+		limit = "100"
+	}
+
+	out := make([]map[string]any, 0, 256)
+	shards := s.meta.ShardsSnapshot()
+	seen := map[string]bool{}
+	for _, shard := range shards {
+		nodeID := shard.Leader
+		if seen[nodeID] {
+			continue
+		}
+		seen[nodeID] = true
+		addr, err := s.addressByNodeID(nodeID)
+		if err != nil {
+			continue
+		}
+		target := fmt.Sprintf("http://localhost%s/v1/streams?cursor=%s&limit=%s", addr, url.QueryEscape(cursor), url.QueryEscape(limit))
+		status, payload, err := s.forwardNode(r.Context(), http.MethodGet, target, nil)
+		if err != nil || status != http.StatusOK {
+			continue
+		}
+		var resp nodeStreamsResponse
+		if err := json.Unmarshal(payload, &resp); err != nil {
+			continue
+		}
+		for _, ev := range resp.Events {
+			ev["node_id"] = nodeID
+			out = append(out, ev)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
@@ -363,6 +625,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		for _, rr := range nodeResp.Rows {
 			rows = append(rows, scanRow{
 				Key:     rr.Key,
+				SortKey: rr.SortKey,
 				Item:    rr.Item,
 				ShardID: shard.ID,
 			})
@@ -409,6 +672,46 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 		"shards":      s.meta.ShardsSnapshot(),
 		"table_names": s.meta.TableNames(),
 	})
+}
+
+func (s *Server) handleUpsertTable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req tableUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Name == "" || req.PartitionKey == "" {
+		writeError(w, http.StatusBadRequest, "name and partition_key are required")
+		return
+	}
+	if req.ReplicationFactor == 0 {
+		req.ReplicationFactor = 2
+	}
+
+	t := metadata.Table{
+		Name:              req.Name,
+		PartitionKey:      req.PartitionKey,
+		SortKey:           req.SortKey,
+		GSI1Name:          req.GSI1Name,
+		GSI1PKAttribute:   req.GSI1PKAttribute,
+		GSI1SKAttribute:   req.GSI1SKAttribute,
+		TTLAttribute:      req.TTLAttribute,
+		ReplicationFactor: req.ReplicationFactor,
+	}
+	if err := s.meta.UpsertTable(t); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.pushTableMetadata(r.Context(), t); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "table": t})
 }
 
 func (s *Server) handleAddNode(w http.ResponseWriter, r *http.Request) {
@@ -562,11 +865,12 @@ func (s *Server) collectAllRecords(ctx context.Context, shards []metadata.Shard,
 				}
 
 				for _, row := range resp.Rows {
-					id := table + "\x00" + row.Key
+					id := table + "\x00" + row.Key + "\x00" + row.SortKey
 					recordsByKey[id] = rebalanceRecord{
-						Table: table,
-						Key:   row.Key,
-						Item:  row.Item,
+						Table:   table,
+						Key:     row.Key,
+						SortKey: row.SortKey,
+						Item:    row.Item,
 					}
 				}
 
@@ -596,6 +900,7 @@ func (s *Server) replayRecords(ctx context.Context, records []rebalanceRecord) (
 		body, err := json.Marshal(nodeUpsertRequest{
 			Table:   rec.Table,
 			Key:     rec.Key,
+			SortKey: rec.SortKey,
 			Item:    rec.Item,
 			ShardID: shardID,
 		})
@@ -629,6 +934,24 @@ func (s *Server) pushTopology(ctx context.Context, shards []metadata.Shard, addr
 		}
 		if status != http.StatusOK {
 			return fmt.Errorf("topology push failed for %s status=%d body=%s", nodeID, status, strings.TrimSpace(string(payload)))
+		}
+	}
+	return nil
+}
+
+func (s *Server) pushTableMetadata(ctx context.Context, table metadata.Table) error {
+	body, err := json.Marshal(nodeTableUpsertRequest{Table: table})
+	if err != nil {
+		return err
+	}
+	addrs, _ := s.nodeStateSnapshot()
+	for nodeID, addr := range addrs {
+		status, payload, err := s.forwardNode(ctx, http.MethodPost, "http://localhost"+addr+"/v1/admin/table/upsert", body)
+		if err != nil {
+			return fmt.Errorf("table upsert push failed for %s: %w", nodeID, err)
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("table upsert push failed for %s status=%d body=%s", nodeID, status, strings.TrimSpace(string(payload)))
 		}
 	}
 	return nil
