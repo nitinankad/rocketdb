@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -38,12 +39,20 @@ func (s *Server) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/route", s.handleRoute)
+	mux.HandleFunc("/v1/kv", s.handleKV)
 	mux.HandleFunc("/v1/scan", s.handleScan)
 }
 
 type routeRequest struct {
 	Table        string `json:"table"`
 	PartitionKey string `json:"partition_key"`
+}
+
+type kvRequest struct {
+	Table       string `json:"table"`
+	Key         string `json:"key"`
+	Value       string `json:"value,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
 }
 
 type scanRequest struct {
@@ -104,6 +113,137 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 
 	route := s.router.RouteByPartitionKey(req.PartitionKey)
 	writeJSON(w, http.StatusOK, route)
+}
+
+func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetKV(w, r)
+	case http.MethodPut:
+		s.handlePutKV(w, r)
+	case http.MethodDelete:
+		s.handleDeleteKV(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
+	table := r.URL.Query().Get("table")
+	key := r.URL.Query().Get("key")
+	consistency := r.URL.Query().Get("consistency")
+	if consistency == "" {
+		consistency = "strong"
+	}
+	if consistency != "strong" && consistency != "eventual" {
+		writeError(w, http.StatusBadRequest, "consistency must be strong or eventual")
+		return
+	}
+	if table == "" || key == "" {
+		writeError(w, http.StatusBadRequest, "table and key are required")
+		return
+	}
+	if _, err := s.meta.Table(table); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	addr, _, err := s.resolveNodeForKey(key, consistency)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	nodeURL := fmt.Sprintf("http://localhost%s/v1/kv?table=%s&key=%s",
+		addr,
+		url.QueryEscape(table),
+		url.QueryEscape(key),
+	)
+	status, payload, err := s.forwardNode(r.Context(), http.MethodGet, nodeURL, nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSONRaw(w, status, payload)
+}
+
+func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
+	var req kvRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Table == "" || req.Key == "" {
+		writeError(w, http.StatusBadRequest, "table and key are required")
+		return
+	}
+	if _, err := s.meta.Table(req.Table); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	addr, shardID, err := s.resolveNodeForKey(req.Key, "strong")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	nodeBody, err := json.Marshal(map[string]any{
+		"table":    req.Table,
+		"key":      req.Key,
+		"value":    req.Value,
+		"shard_id": shardID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	status, payload, err := s.forwardNode(r.Context(), http.MethodPut, "http://localhost"+addr+"/v1/kv", nodeBody)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSONRaw(w, status, payload)
+}
+
+func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
+	var req kvRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Table == "" || req.Key == "" {
+		writeError(w, http.StatusBadRequest, "table and key are required")
+		return
+	}
+	if _, err := s.meta.Table(req.Table); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	addr, shardID, err := s.resolveNodeForKey(req.Key, "strong")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	nodeBody, err := json.Marshal(map[string]any{
+		"table":    req.Table,
+		"key":      req.Key,
+		"shard_id": shardID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	status, payload, err := s.forwardNode(r.Context(), http.MethodDelete, "http://localhost"+addr+"/v1/kv", nodeBody)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSONRaw(w, status, payload)
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +385,49 @@ func (s *Server) scanNode(ctx context.Context, addr string, req nodeScanRequest)
 	return out, nil
 }
 
+func (s *Server) resolveNodeForKey(key, consistency string) (string, int, error) {
+	route := s.router.RouteByPartitionKey(key)
+	shard, err := s.meta.ShardByID(route.ShardID)
+	if err != nil {
+		return "", 0, err
+	}
+
+	nodeID := shard.Leader
+	if consistency == "eventual" && len(shard.Followers) > 0 {
+		nodeID = shard.Followers[0]
+	}
+	addr, err := s.cluster.AddressByNodeID(nodeID)
+	if err != nil {
+		return "", 0, err
+	}
+	return addr, route.ShardID, nil
+}
+
+func (s *Server) forwardNode(ctx context.Context, method, targetURL string, body []byte) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, payload, nil
+}
+
 func parseGatewayCursor(cursor string) (int, string, error) {
 	if cursor == "" {
 		return 0, "", nil
@@ -264,6 +447,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONRaw(w http.ResponseWriter, status int, payload []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(payload)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
