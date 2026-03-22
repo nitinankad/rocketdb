@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"path/filepath"
 
 	"github.com/nitinankad/rocketdb/internal/config"
 	"github.com/nitinankad/rocketdb/internal/gateway"
@@ -29,16 +30,22 @@ func main() {
 	}()
 
 	for _, n := range cluster.Nodes {
-		node := shard.NewNode(n.ID, storage.NewInMemory(), replication.NewNoopManager(), meta)
+		storePath := filepath.Join("data", "local", n.ID+".json")
+		store, err := storage.NewDisk(storePath)
+		if err != nil {
+			log.Fatalf("storage init failed id=%s: %v", n.ID, err)
+		}
+
+		node := shard.NewNode(n.ID, store, replication.NewNoopManager(), meta)
 		nodeMux := http.NewServeMux()
 		node.RegisterHTTP(nodeMux)
 
-		go func(nodeID, addr string, mux *http.ServeMux) {
-			log.Printf("rocketdb-node id=%s addr=%s", nodeID, addr)
+		go func(nodeID, addr, dataPath string, mux *http.ServeMux) {
+			log.Printf("rocketdb-node id=%s addr=%s data=%s", nodeID, addr, dataPath)
 			if err := http.ListenAndServe(addr, mux); err != nil {
 				log.Fatalf("node server failed id=%s: %v", nodeID, err)
 			}
-		}(n.ID, n.Address, nodeMux)
+		}(n.ID, n.Address, storePath, nodeMux)
 	}
 
 	select {}

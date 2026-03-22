@@ -26,8 +26,15 @@ Run components separately:
 
 ```bash
 go run ./cmd/rocketdb-gateway --addr :8080
-go run ./cmd/rocketdb-node --node-id node-1 --addr :8081
+go run ./cmd/rocketdb-node --node-id node-1 --addr :8081 --data-dir ./data/single
 ```
+
+Data persistence:
+
+- local cluster writes shard data under `./data/local/*.json.wal` (append-only WAL)
+- single node mode writes under `--data-dir` (default `./data/single`)
+- restart the process and previously written keys remain on disk
+- if a legacy `*.json` snapshot exists, it is loaded on startup before WAL replay
 
 ## Quick API Smoke Test
 

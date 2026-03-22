@@ -189,6 +189,17 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
+		if len(rows) == req.Limit {
+			if nodeResp.NextCursor != "" {
+				nextCursor = fmt.Sprintf("%d|%s", i, nodeResp.NextCursor)
+			} else if len(nodeResp.Rows) > 0 && i < len(s.meta.Shards)-1 {
+				// Continue from the key we just returned, then move to next shard.
+				lastKey := nodeResp.Rows[len(nodeResp.Rows)-1].Key
+				nextCursor = fmt.Sprintf("%d|%s", i, lastKey)
+			}
+			break
+		}
+
 		if nodeResp.NextCursor != "" {
 			nextCursor = fmt.Sprintf("%d|%s", i, nodeResp.NextCursor)
 			break
