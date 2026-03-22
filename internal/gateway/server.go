@@ -1,13 +1,10 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,16 +13,18 @@ import (
 	"github.com/nitinankad/rocketdb/internal/config"
 	"github.com/nitinankad/rocketdb/internal/metadata"
 	"github.com/nitinankad/rocketdb/internal/router"
+	"github.com/nitinankad/rocketdb/internal/transport"
 )
 
 type Server struct {
-	router     *router.Router
-	meta       *metadata.Service
-	httpClient *http.Client
+	router *router.Router
+	meta   *metadata.Service
+	mux    *http.ServeMux
 
 	mu        sync.RWMutex
 	nodeAddrs map[string]string
 	nodeOrder []string
+	clients   map[string]*transport.Client
 }
 
 func NewServer(rt *router.Router, meta *metadata.Service, cluster config.Cluster) *Server {
@@ -36,15 +35,16 @@ func NewServer(rt *router.Router, meta *metadata.Service, cluster config.Cluster
 		nodeOrder = append(nodeOrder, n.ID)
 	}
 
-	return &Server{
+	srv := &Server{
 		router: rt,
 		meta:   meta,
-		httpClient: &http.Client{
-			Timeout: 3 * time.Second,
-		},
+		mux:    http.NewServeMux(),
 		nodeAddrs: nodeAddrs,
 		nodeOrder: nodeOrder,
+		clients:   make(map[string]*transport.Client, len(cluster.Nodes)),
 	}
+	srv.RegisterHTTP(srv.mux)
+	return srv
 }
 
 func (s *Server) RegisterHTTP(mux *http.ServeMux) {
@@ -60,6 +60,10 @@ func (s *Server) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/admin/tables/upsert", s.handleUpsertTable)
 	mux.HandleFunc("/v1/admin/nodes/add", s.handleAddNode)
 	mux.HandleFunc("/v1/admin/nodes/remove", s.handleRemoveNode)
+}
+
+func (s *Server) HandleRPC(ctx context.Context, req transport.Request) (transport.Response, error) {
+	return transport.DispatchHTTP(ctx, s.mux, req)
 }
 
 type routeRequest struct {
@@ -250,13 +254,15 @@ func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodeURL := fmt.Sprintf("http://localhost%s/v1/kv?table=%s&key=%s&sort_key=%s",
-		addr,
-		url.QueryEscape(table),
-		url.QueryEscape(key),
-		url.QueryEscape(sortKey),
-	)
-	status, payload, err := s.forwardNode(r.Context(), http.MethodGet, nodeURL, nil)
+	status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+		Method: http.MethodGet,
+		Path:   "/v1/kv",
+		Query: map[string]string{
+			"table":    table,
+			"key":      key,
+			"sort_key": sortKey,
+		},
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -298,7 +304,11 @@ func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, payload, err := s.forwardNode(r.Context(), http.MethodPut, "http://localhost"+addr+"/v1/kv", nodeBody)
+	status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+		Method: http.MethodPut,
+		Path:   "/v1/kv",
+		Body:   nodeBody,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -338,7 +348,11 @@ func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, payload, err := s.forwardNode(r.Context(), http.MethodDelete, "http://localhost"+addr+"/v1/kv", nodeBody)
+	status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+		Method: http.MethodDelete,
+		Path:   "/v1/kv",
+		Body:   nodeBody,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -390,7 +404,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, payload, err := s.forwardNode(r.Context(), http.MethodPost, "http://localhost"+addr+"/v1/query", body)
+	status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/query",
+		Body:   body,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -469,7 +487,11 @@ func (s *Server) handleQueryGSI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		status, payload, err := s.forwardNode(r.Context(), http.MethodPost, "http://localhost"+addr+"/v1/query-gsi", body)
+		status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+			Method: http.MethodPost,
+			Path:   "/v1/query-gsi",
+			Body:   body,
+		})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -529,8 +551,14 @@ func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		target := fmt.Sprintf("http://localhost%s/v1/streams?cursor=%s&limit=%s", addr, url.QueryEscape(cursor), url.QueryEscape(limit))
-		status, payload, err := s.forwardNode(r.Context(), http.MethodGet, target, nil)
+		status, payload, err := s.forwardNode(r.Context(), addr, transport.Request{
+			Method: http.MethodGet,
+			Path:   "/v1/streams",
+			Query: map[string]string{
+				"cursor": cursor,
+				"limit":  limit,
+			},
+		})
 		if err != nil || status != http.StatusOK {
 			continue
 		}
@@ -908,7 +936,11 @@ func (s *Server) replayRecords(ctx context.Context, records []rebalanceRecord) (
 			return moved, err
 		}
 
-		status, payload, err := s.forwardNode(ctx, http.MethodPut, "http://localhost"+addr+"/v1/kv", body)
+		status, payload, err := s.forwardNode(ctx, addr, transport.Request{
+			Method: http.MethodPut,
+			Path:   "/v1/kv",
+			Body:   body,
+		})
 		if err != nil {
 			return moved, err
 		}
@@ -928,7 +960,11 @@ func (s *Server) pushTopology(ctx context.Context, shards []metadata.Shard, addr
 	}
 
 	for nodeID, addr := range addrs {
-		status, payload, err := s.forwardNode(ctx, http.MethodPost, "http://localhost"+addr+"/v1/admin/topology", body)
+		status, payload, err := s.forwardNode(ctx, addr, transport.Request{
+			Method: http.MethodPost,
+			Path:   "/v1/admin/topology",
+			Body:   body,
+		})
 		if err != nil {
 			return fmt.Errorf("topology push failed for %s: %w", nodeID, err)
 		}
@@ -946,7 +982,11 @@ func (s *Server) pushTableMetadata(ctx context.Context, table metadata.Table) er
 	}
 	addrs, _ := s.nodeStateSnapshot()
 	for nodeID, addr := range addrs {
-		status, payload, err := s.forwardNode(ctx, http.MethodPost, "http://localhost"+addr+"/v1/admin/table/upsert", body)
+		status, payload, err := s.forwardNode(ctx, addr, transport.Request{
+			Method: http.MethodPost,
+			Path:   "/v1/admin/table/upsert",
+			Body:   body,
+		})
 		if err != nil {
 			return fmt.Errorf("table upsert push failed for %s: %w", nodeID, err)
 		}
@@ -963,7 +1003,11 @@ func (s *Server) scanNode(ctx context.Context, addr string, req nodeScanRequest)
 		return nodeScanResponse{}, err
 	}
 
-	status, payload, err := s.forwardNode(ctx, http.MethodPost, "http://localhost"+addr+"/v1/scan", body)
+	status, payload, err := s.forwardNode(ctx, addr, transport.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/scan",
+		Body:   body,
+	})
 	if err != nil {
 		return nodeScanResponse{}, err
 	}
@@ -1017,33 +1061,38 @@ func (s *Server) nodeStateSnapshot() (map[string]string, []string) {
 func (s *Server) setNodeState(nodeAddrs map[string]string, nodeOrder []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	for addr, client := range s.clients {
+		if !containsAddr(nodeAddrs, addr) {
+			client.Close()
+			delete(s.clients, addr)
+		}
+	}
 	s.nodeAddrs = copyNodeAddrs(nodeAddrs)
 	s.nodeOrder = append([]string(nil), nodeOrder...)
 }
 
-func (s *Server) forwardNode(ctx context.Context, method, targetURL string, body []byte) (int, []byte, error) {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, reader)
+func (s *Server) forwardNode(ctx context.Context, addr string, req transport.Request) (int, []byte, error) {
+	client := s.clientForAddr(addr)
+	resp, err := client.Do(ctx, req)
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	return resp.Status, resp.Body, nil
+}
 
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
+func (s *Server) clientForAddr(addr string) *transport.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, err
+	client, ok := s.clients[addr]
+	if ok {
+		return client
 	}
-	return resp.StatusCode, payload, nil
+
+	client = transport.NewClient(addr, 3*time.Second, 8)
+	s.clients[addr] = client
+	return client
 }
 
 func chooseItem(req kvRequest) map[string]any {
@@ -1077,6 +1126,15 @@ func copyNodeAddrs(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func containsAddr(addrs map[string]string, target string) bool {
+	for _, addr := range addrs {
+		if addr == target {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGatewayCursor(cursor string) (int, string, error) {

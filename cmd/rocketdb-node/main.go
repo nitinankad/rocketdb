@@ -3,13 +3,13 @@ package main
 import (
 	"flag"
 	"log"
-	"net/http"
 	"path/filepath"
 
 	"github.com/nitinankad/rocketdb/internal/metadata"
 	"github.com/nitinankad/rocketdb/internal/replication"
 	"github.com/nitinankad/rocketdb/internal/shard"
 	"github.com/nitinankad/rocketdb/internal/storage"
+	"github.com/nitinankad/rocketdb/internal/transport"
 )
 
 func main() {
@@ -27,11 +27,8 @@ func main() {
 	repl := replication.NewNoopManager()
 	node := shard.NewNode(*nodeID, store, repl, meta)
 
-	mux := http.NewServeMux()
-	node.RegisterHTTP(mux)
-
 	log.Printf("rocketdb-node id=%s addr=%s data=%s", *nodeID, *addr, storePath)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
+	if err := transport.NewServer(node.HandleRPC).ListenAndServe(*addr); err != nil {
 		log.Fatalf("node server failed: %v", err)
 	}
 }

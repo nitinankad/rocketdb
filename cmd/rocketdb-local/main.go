@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"net/http"
 	"path/filepath"
 
 	"github.com/nitinankad/rocketdb/internal/config"
@@ -12,6 +11,7 @@ import (
 	"github.com/nitinankad/rocketdb/internal/router"
 	"github.com/nitinankad/rocketdb/internal/shard"
 	"github.com/nitinankad/rocketdb/internal/storage"
+	"github.com/nitinankad/rocketdb/internal/transport"
 )
 
 func main() {
@@ -20,11 +20,9 @@ func main() {
 	rt := router.New(meta)
 
 	gatewaySrv := gateway.NewServer(rt, meta, cluster)
-	gatewayMux := http.NewServeMux()
-	gatewaySrv.RegisterHTTP(gatewayMux)
 	go func() {
 		log.Printf("rocketdb-gateway addr=%s", cluster.GatewayAddress)
-		if err := http.ListenAndServe(cluster.GatewayAddress, gatewayMux); err != nil {
+		if err := transport.NewServer(gatewaySrv.HandleRPC).ListenAndServe(cluster.GatewayAddress); err != nil {
 			log.Fatalf("gateway server failed: %v", err)
 		}
 	}()
@@ -37,15 +35,12 @@ func main() {
 		}
 
 		node := shard.NewNode(n.ID, store, replication.NewNoopManager(), meta)
-		nodeMux := http.NewServeMux()
-		node.RegisterHTTP(nodeMux)
-
-		go func(nodeID, addr, dataPath string, mux *http.ServeMux) {
+		go func(nodeID, addr, dataPath string) {
 			log.Printf("rocketdb-node id=%s addr=%s data=%s", nodeID, addr, dataPath)
-			if err := http.ListenAndServe(addr, mux); err != nil {
+			if err := transport.NewServer(node.HandleRPC).ListenAndServe(addr); err != nil {
 				log.Fatalf("node server failed id=%s: %v", nodeID, err)
 			}
-		}(n.ID, n.Address, storePath, nodeMux)
+		}(n.ID, n.Address, storePath)
 	}
 
 	select {}

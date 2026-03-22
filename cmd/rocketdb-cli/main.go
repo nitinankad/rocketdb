@@ -2,20 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nitinankad/rocketdb/internal/transport"
 )
 
-const defaultGateway = "http://localhost:8080"
+const defaultGateway = "127.0.0.1:8080"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -54,7 +54,7 @@ func main() {
 
 func runPut(args []string) {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
 	sortKey := fs.String("sort-key", "", "optional sort key")
@@ -83,14 +83,14 @@ func runPut(args []string) {
 	body, err := json.Marshal(reqPayload)
 	must(err)
 
-	status, payload, err := request(http.MethodPut, strings.TrimRight(*gateway, "/")+"/v1/kv", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "PUT", Path: "/v1/kv", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runGet(args []string) {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
 	sortKey := fs.String("sort-key", "", "optional sort key")
@@ -101,23 +101,23 @@ func runGet(args []string) {
 	require(*key != "", "--key is required")
 	require(*consistency == "strong" || *consistency == "eventual", "--consistency must be strong or eventual")
 
-	target := fmt.Sprintf(
-		"%s/v1/kv?table=%s&key=%s&sort_key=%s&consistency=%s",
-		strings.TrimRight(*gateway, "/"),
-		url.QueryEscape(*table),
-		url.QueryEscape(*key),
-		url.QueryEscape(*sortKey),
-		url.QueryEscape(*consistency),
-	)
-
-	status, payload, err := request(http.MethodGet, target, nil)
+	status, payload, err := request(*gateway, transport.Request{
+		Method: "GET",
+		Path:   "/v1/kv",
+		Query: map[string]string{
+			"table":       *table,
+			"key":         *key,
+			"sort_key":    *sortKey,
+			"consistency": *consistency,
+		},
+	})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runDelete(args []string) {
 	fs := flag.NewFlagSet("del", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "record key")
 	sortKey := fs.String("sort-key", "", "optional sort key")
@@ -133,14 +133,14 @@ func runDelete(args []string) {
 	})
 	must(err)
 
-	status, payload, err := request(http.MethodDelete, strings.TrimRight(*gateway, "/")+"/v1/kv", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "DELETE", Path: "/v1/kv", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runScan(args []string) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	limit := fs.Int("limit", 50, "page size")
 	cursor := fs.String("cursor", "", "pagination cursor")
@@ -158,14 +158,14 @@ func runScan(args []string) {
 	})
 	must(err)
 
-	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/scan", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "POST", Path: "/v1/scan", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runQuery(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	key := fs.String("key", "", "partition key")
 	sortOp := fs.String("sort-op", "", "sort op: any|eq|begins_with|gt|gte|lt|lte")
@@ -188,14 +188,14 @@ func runQuery(args []string) {
 		"consistency": *consistency,
 	})
 	must(err)
-	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/query", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "POST", Path: "/v1/query", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runQueryGSI(args []string) {
 	fs := flag.NewFlagSet("query-gsi", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	table := fs.String("table", "", "table name")
 	index := fs.String("index", "gsi1", "index name")
 	pkValue := fs.String("pk-value", "", "gsi partition value")
@@ -220,14 +220,14 @@ func runQueryGSI(args []string) {
 		"consistency": *consistency,
 	})
 	must(err)
-	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/query-gsi", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "POST", Path: "/v1/query-gsi", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runTableUpsert(args []string) {
 	fs := flag.NewFlagSet("table-upsert", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	name := fs.String("name", "", "table name")
 	pk := fs.String("pk", "key", "partition key field name")
 	sk := fs.String("sk", "", "sort key field name")
@@ -250,27 +250,33 @@ func runTableUpsert(args []string) {
 		"replication_factor": 2,
 	})
 	must(err)
-	status, payload, err := request(http.MethodPost, strings.TrimRight(*gateway, "/")+"/v1/admin/tables/upsert", body)
+	status, payload, err := request(*gateway, transport.Request{Method: "POST", Path: "/v1/admin/tables/upsert", Body: body})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runStreams(args []string) {
 	fs := flag.NewFlagSet("streams", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	cursor := fs.Int64("cursor", 0, "stream cursor")
 	limit := fs.Int("limit", 100, "max events")
 	_ = fs.Parse(args)
 
-	target := fmt.Sprintf("%s/v1/streams?cursor=%d&limit=%d", strings.TrimRight(*gateway, "/"), *cursor, *limit)
-	status, payload, err := request(http.MethodGet, target, nil)
+	status, payload, err := request(*gateway, transport.Request{
+		Method: "GET",
+		Path:   "/v1/streams",
+		Query: map[string]string{
+			"cursor": strconv.FormatInt(*cursor, 10),
+			"limit":  strconv.Itoa(*limit),
+		},
+	})
 	must(err)
 	printResponse(status, payload)
 }
 
 func runSQL(args []string) {
 	fs := flag.NewFlagSet("sql", flag.ExitOnError)
-	gateway := fs.String("gateway", defaultGateway, "gateway base URL")
+	gateway := fs.String("gateway", defaultGateway, "gateway address")
 	_ = fs.Parse(args)
 
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -281,7 +287,6 @@ func runSQL(args []string) {
 	insertRe := regexp.MustCompile(`(?is)^\s*insert\s+into\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*values\s*\((.+)\)\s*;?\s*$`)
 	deleteRe := regexp.MustCompile(`(?i)^\s*delete\s+from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+where\s+key\s*=\s*'([^']+)'\s*;?\s*$`)
 
-	base := strings.TrimRight(*gateway, "/")
 	if m := selectGetRe.FindStringSubmatch(query); m != nil {
 		table := m[1]
 		key := m[2]
@@ -289,13 +294,15 @@ func runSQL(args []string) {
 		if len(m) > 3 && m[3] != "" {
 			consistency = strings.ToLower(m[3])
 		}
-		target := fmt.Sprintf("%s/v1/kv?table=%s&key=%s&consistency=%s",
-			base,
-			url.QueryEscape(table),
-			url.QueryEscape(key),
-			url.QueryEscape(consistency),
-		)
-		status, payload, err := request(http.MethodGet, target, nil)
+		status, payload, err := request(*gateway, transport.Request{
+			Method: "GET",
+			Path:   "/v1/kv",
+			Query: map[string]string{
+				"table":       table,
+				"key":         key,
+				"consistency": consistency,
+			},
+		})
 		must(err)
 		printResponse(status, payload)
 		return
@@ -319,7 +326,7 @@ func runSQL(args []string) {
 			"consistency": consistency,
 		})
 		must(err)
-		status, payload, err := request(http.MethodPost, base+"/v1/scan", body)
+		status, payload, err := request(*gateway, transport.Request{Method: "POST", Path: "/v1/scan", Body: body})
 		must(err)
 		printResponse(status, payload)
 		return
@@ -361,7 +368,7 @@ func runSQL(args []string) {
 			"item":     item,
 		})
 		must(err)
-		status, payload, err := request(http.MethodPut, base+"/v1/kv", body)
+		status, payload, err := request(*gateway, transport.Request{Method: "PUT", Path: "/v1/kv", Body: body})
 		must(err)
 		printResponse(status, payload)
 		return
@@ -375,7 +382,7 @@ func runSQL(args []string) {
 			"key":   key,
 		})
 		must(err)
-		status, payload, err := request(http.MethodDelete, base+"/v1/kv", body)
+		status, payload, err := request(*gateway, transport.Request{Method: "DELETE", Path: "/v1/kv", Body: body})
 		must(err)
 		printResponse(status, payload)
 		return
@@ -447,31 +454,15 @@ func parseSQLLiteral(token string) (any, error) {
 	return nil, fmt.Errorf("unsupported SQL literal: %s", token)
 }
 
-func request(method, target string, body []byte) (int, []byte, error) {
-	client := &http.Client{Timeout: 3 * time.Second}
+func request(addr string, req transport.Request) (int, []byte, error) {
+	client := transport.NewClient(addr, 3*time.Second, 1)
+	defer client.Close()
 
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequest(method, target, reader)
+	resp, err := client.Do(context.Background(), req)
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, err
-	}
-	return resp.StatusCode, payload, nil
+	return resp.Status, resp.Body, nil
 }
 
 func printResponse(status int, payload []byte) {
@@ -509,13 +500,13 @@ func printUsage() {
 	fmt.Println("rocketdb-cli: simple gateway client")
 	fmt.Println("")
 	fmt.Println("Usage:")
-	fmt.Println("  rocketdb-cli put  --table users --key user-1 [--value 'Ada'] [--item '{\"name\":\"Ada\",\"age\":42}'] [--gateway http://localhost:8080]")
-	fmt.Println("  rocketdb-cli get  --table users --key user-1 [--consistency strong|eventual] [--gateway http://localhost:8080]")
-	fmt.Println("  rocketdb-cli del  --table users --key user-1 [--gateway http://localhost:8080]")
-	fmt.Println("  rocketdb-cli scan --table users [--limit 50] [--cursor '<cursor>'] [--consistency strong|eventual] [--gateway http://localhost:8080]")
-	fmt.Println("  rocketdb-cli query --table users --key p1 [--sort-op begins_with --sort-value 2026-] [--gateway http://localhost:8080]")
+	fmt.Println("  rocketdb-cli put  --table users --key user-1 [--value 'Ada'] [--item '{\"name\":\"Ada\",\"age\":42}'] [--gateway 127.0.0.1:8080]")
+	fmt.Println("  rocketdb-cli get  --table users --key user-1 [--consistency strong|eventual] [--gateway 127.0.0.1:8080]")
+	fmt.Println("  rocketdb-cli del  --table users --key user-1 [--gateway 127.0.0.1:8080]")
+	fmt.Println("  rocketdb-cli scan --table users [--limit 50] [--cursor '<cursor>'] [--consistency strong|eventual] [--gateway 127.0.0.1:8080]")
+	fmt.Println("  rocketdb-cli query --table users --key p1 [--sort-op begins_with --sort-value 2026-] [--gateway 127.0.0.1:8080]")
 	fmt.Println("  rocketdb-cli query-gsi --table users --index by_email --pk-value a@x.com [--sk-op gte --sk-value 0]")
 	fmt.Println("  rocketdb-cli table-upsert --name users --pk key --sk sort_key --gsi-name by_email --gsi-pk-attr email --gsi-sk-attr created_at")
 	fmt.Println("  rocketdb-cli streams [--cursor 0] [--limit 100]")
-	fmt.Println("  rocketdb-cli sql  \"insert into users (key, name, age) values ('u1','Ada',42)\" [--gateway http://localhost:8080]")
+	fmt.Println("  rocketdb-cli sql  \"insert into users (key, name, age) values ('u1','Ada',42)\" [--gateway 127.0.0.1:8080]")
 }

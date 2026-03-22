@@ -15,6 +15,7 @@ import (
 	"github.com/nitinankad/rocketdb/internal/metadata"
 	"github.com/nitinankad/rocketdb/internal/replication"
 	"github.com/nitinankad/rocketdb/internal/storage"
+	"github.com/nitinankad/rocketdb/internal/transport"
 )
 
 const keySep = "\x1f"
@@ -24,6 +25,7 @@ type Node struct {
 	store       storage.Engine
 	replication replication.Manager
 	meta        *metadata.Service
+	mux         *http.ServeMux
 
 	streamMu      sync.RWMutex
 	streamCursor  int64
@@ -47,6 +49,8 @@ func NewNode(id string, store storage.Engine, repl replication.Manager, meta *me
 		replication: repl,
 		meta:        meta,
 	}
+	n.mux = http.NewServeMux()
+	n.RegisterHTTP(n.mux)
 	go n.ttlLoop()
 	return n
 }
@@ -61,6 +65,10 @@ func (n *Node) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/streams", n.handleStreams)
 	mux.HandleFunc("/v1/admin/topology", n.handleTopology)
 	mux.HandleFunc("/v1/admin/table/upsert", n.handleUpsertTable)
+}
+
+func (n *Node) HandleRPC(ctx context.Context, req transport.Request) (transport.Response, error) {
+	return transport.DispatchHTTP(ctx, n.mux, req)
 }
 
 type writeCondition struct {
